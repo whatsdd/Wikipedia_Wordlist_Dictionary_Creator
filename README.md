@@ -26,6 +26,9 @@ Credits to ChrisAD for the original PowerShell version: https://github.com/Chris
 - **Verbose / debug logging** via `--verbose`.
 - Force re-download with `--force`.
 - Cross-platform output directory (Linux/macOS/Windows).
+- **Web-crawling mode** (`--url` / `--url-file`) — crawl any website like [cewler](https://github.com/roys/cewler), no external deps.
+- Emoji and Unicode symbol stripping from all output (always on).
+- Graceful Ctrl+C — saves partial results instead of losing everything.
 - Zero external dependencies — Python 3.6+ standard library only.
 
 ---
@@ -123,6 +126,47 @@ python3 Wikipedia-Wordlist-Generator.py --popular --password-mode --min-length 5
 
 ---
 
+### Web-crawling mode (`--url` / `--url-file`)
+
+Crawl any website and extract a wordlist — inspired by [cewler](https://github.com/roys/cewler). No extra dependencies needed.
+
+```sh
+# Crawl a single site (depth 2, same domain only)
+python3 Wikipedia-Wordlist-Generator.py --url https://example.com --depth 2 --scope exact
+
+# Crawl and generate password candidates
+python3 Wikipedia-Wordlist-Generator.py --url https://example.com --depth 3 --password-mode --min-length 5
+
+# Crawl including child subdomains
+python3 Wikipedia-Wordlist-Generator.py --url https://example.com --scope children --depth 2
+
+# Crawl multiple URLs from a file (one URL per line, # for comments)
+python3 Wikipedia-Wordlist-Generator.py --url-file targets.txt --depth 2 --scope exact
+```
+
+**targets.txt example:**
+```
+# Company sites
+https://example.com
+https://docs.example.com
+# https://skipped.example.com
+```
+
+Output saved as `{domain}-wordlist.txt` (single URL) or `crawl-merged-wordlist.txt` (multiple URLs).
+
+**Crawl options:**
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--url URL` | — | Single start URL |
+| `--url-file FILE` | — | File with one URL per line |
+| `--depth N` | 2 | Max link-follow hops |
+| `--rate N` | 5.0 | Requests per second |
+| `--scope` | `exact` | `exact` same domain / `children` include subdomains / `all` parent+sister domains |
+| `--user-agent STR` | Chrome UA | Custom User-Agent header |
+
+---
+
 ### Force re-download / custom output dir
 
 ```sh
@@ -134,21 +178,35 @@ python3 Wikipedia-Wordlist-Generator.py --language no --force --output-dir /tmp/
 ## All options
 
 ```
-usage: Wikipedia-Wordlist-Generator.py [-h] [--language CODE [CODE ...]]
-                                       [--output-dir DIR] [--force]
-                                       [--min-length N] [--max-length N]
-                                       [--no-numbers] [--password-mode]
-                                       [--popular] [--verbose]
+usage: Wikipedia-Wordlist-Generator.py [-h] [--url URL | --url-file FILE]
+                                       [--depth N] [--rate N]
+                                       [--scope {exact,children,all}]
+                                       [--user-agent STR]
+                                       [--language CODE [CODE ...]]
+                                       [--popular] [--force]
+                                       [--output-dir DIR] [--min-length N]
+                                       [--max-length N] [--no-numbers]
+                                       [--password-mode] [--verbose]
 
-options:
+web crawl mode:
+  --url URL             Crawl this URL and extract a wordlist
+  --url-file FILE       Text file with one URL per line; crawls all, merges results
+  --depth N, -d N       Maximum crawl depth (default: 2)
+  --rate N, -r N        Requests per second (default: 5.0)
+  --scope               exact (default) | children | all
+  --user-agent STR      Custom User-Agent
+
+wikipedia dump mode:
   --language CODE       Language code(s): 'no', 'sv', 'en,no,de', or repeated flags
-  --output-dir DIR      Directory to save output files
+  --popular             Download all 18 major language dumps
   --force, -f           Re-download even if cached file exists
+
+shared options:
+  --output-dir DIR      Directory to save output files
   --min-length N        Minimum word length (default: 3)
   --max-length N        Maximum word length (default: no limit)
   --no-numbers          Exclude purely numeric words
   --password-mode       Generate near-human password candidates
-  --popular             Download all 18 major language dumps
   --verbose, -v         Enable debug logging
 ```
 

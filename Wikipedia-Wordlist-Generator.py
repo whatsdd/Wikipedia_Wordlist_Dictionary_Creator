@@ -5,18 +5,19 @@ import re
 import sys
 import time
 import urllib.request
-from collections import Counter
+from collections import Counter, deque
+from html.parser import HTMLParser
 from pathlib import Path
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
-# ── Logging ────────────────────────────────────────────────────────────────────────────────
+# ── Logging ────────────────────────────────────────────────────────────────────
 
 def setup_logging(verbose: bool) -> None:
     level = logging.DEBUG if verbose else logging.INFO
     logging.basicConfig(format="[%(levelname)s] %(message)s", level=level)
 
 
-# ── Progress bar (stdlib only) ──────────────────────────────────────────────────────────────
+# ── Progress bar (stdlib only) ─────────────────────────────────────────────────
 
 class ProgressBar:
     """Inline ASCII progress bar written to stderr so it doesn't pollute output."""
@@ -52,7 +53,7 @@ class ProgressBar:
 
 
 class SpinnerBar:
-    """Fallback dot-spinner for when total size is unknown."""
+    """Fallback spinner for unknown-size operations."""
 
     FRAMES = ["|", "/", "-", "\\"]
 
@@ -71,7 +72,24 @@ class SpinnerBar:
         sys.stderr.flush()
 
 
-# ── Fetch available dumps ───────────────────────────────────────────────────────────────────
+# ── Regex constants ────────────────────────────────────────────────────────────
+
+_IP_RE = re.compile(r"^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$")
+_HASH_RE = re.compile(r"_[0-9a-f]{4,}$", re.IGNORECASE)
+_SPLIT_RE = re.compile(r"[;,.!@#%&()]")
+_DIGITS_ONLY_RE = re.compile(r"^\d+$")
+_EMOJI_RE = re.compile(
+    "["
+    "\U0001F300-\U0001FAFF"
+    "\U00002000-\U0000206F"
+    "\U00002700-\U000027BF"
+    "\U0000FE00-\U0000FE0F"
+    "]+",
+    flags=re.UNICODE,
+)
+
+
+# ── Fetch available Wikipedia dumps ───────────────────────────────────────────
 
 def get_wikipedia_dumps(retries: int = 3, delay: int = 5):
     url = "https://dumps.wikimedia.org/other/static_html_dumps/current/"
@@ -92,7 +110,7 @@ def get_wikipedia_dumps(retries: int = 3, delay: int = 5):
     return url, []
 
 
-# ── Download titles for one language ────────────────────────────────────────────────────────
+# ── Download titles for one language ──────────────────────────────────────────
 
 def download_titles(
     url: str,
@@ -142,7 +160,7 @@ def download_titles(
     return False
 
 
-# ── Language selection ───────────────────────────────────────────────────────────────────────────────────
+# ── Language selection ─────────────────────────────────────────────────────────
 
 def display_language_options(links: list) -> None:
     if not links:
@@ -186,12 +204,21 @@ def fuzzy_select_language(links: list) -> str:
             print("  Invalid selection, searching again.")
 
 
-# ── Title cleaning ──────────────────────────────────────────────────────────────────────────────────────
+# ── Title cleaning (dump mode) ─────────────────────────────────────────────────
 
-_IP_RE = re.compile(r"^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$")
-_HASH_RE = re.compile(r"_[0-9a-f]{4,}$", re.IGNORECASE)
-_SPLIT_RE = re.compile(r"[;,.!@#%&()]")
-_DIGITS_ONLY_RE = re.compile(r"^\d+$")
+def _filter_word(word: str, min_length: int, max_length, no_numbers: bool):
+    """Return cleaned word or None if it should be excluded."""
+    word = _EMOJI_RE.sub("", word).strip()
+    if not word:
+        return None
+    if no_numbers and _DIGITS_ONLY_RE.fullmatch(word):
+        return None
+    length = len(word)
+    if length < min_length:
+        return None
+    if max_length is not None and length > max_length:
+        return None
+    return word
 
 
 def clean_titles(
@@ -211,42 +238,191 @@ def clean_titles(
     bar = ProgressBar(total, "  Cleaning  ")
 
     cleaned: set = set()
-    for i, line in enumerate(lines):
+    for line in lines:
         bar.update()
         clean = line.strip()
-
         clean = clean.split("/")[-1].split(".")[0]
-
         if "~" in clean:
             clean = clean.split("~")[-1]
-
         clean = _HASH_RE.sub("", clean)
-
         clean = clean.replace("_", "").replace("-", "")
         clean = clean.replace("(", "").replace(")", "")
-
         if _IP_RE.match(clean):
             continue
-
         for word in _SPLIT_RE.split(clean):
-            word = word.strip()
-            if not word:
-                continue
-            if no_numbers and _DIGITS_ONLY_RE.fullmatch(word):
-                continue
-            length = len(word)
-            if length < min_length:
-                continue
-            if max_length is not None and length > max_length:
-                continue
-            cleaned.add(word)
+            w = _filter_word(word, min_length, max_length, no_numbers)
+            if w:
+                cleaned.add(w)
 
     bar.close()
     logging.info("Extracted %d unique words.", len(cleaned))
     return cleaned
 
 
-# ── Password variant generation ────────────────────────────────────────────────────────────────
+# ── Web-crawling mode ──────────────────────────────────────────────────────────
+
+_DEFAULT_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/120.0.0.0 Safari/537.36"
+)
+
+
+class HtmlWordExtractor(HTMLParser):
+    """Extracts visible text and href links from HTML, skipping script/style."""
+
+    _SKIP_TAGS = {"script", "style", "noscript"}
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self._skip_depth = 0
+        self._text_parts: list = []
+        self.links: list = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag.lower() in self._SKIP_TAGS:
+            self._skip_depth += 1
+        if tag.lower() == "a":
+            for attr, val in attrs:
+                if attr == "href" and val and not val.startswith(
+                    ("#", "mailto:", "javascript:", "tel:")
+                ):
+                    self.links.append(val)
+
+    def handle_endtag(self, tag):
+        if tag.lower() in self._SKIP_TAGS:
+            self._skip_depth = max(0, self._skip_depth - 1)
+
+    def handle_data(self, data):
+        if self._skip_depth == 0:
+            self._text_parts.append(data)
+
+    @property
+    def text(self) -> str:
+        return " ".join(self._text_parts)
+
+
+def extract_words_from_html(
+    html: str,
+    base_url: str,
+    min_length: int = 3,
+    max_length: int = None,
+    no_numbers: bool = False,
+):
+    """Parse HTML, return (set_of_words, list_of_absolute_urls)."""
+    parser = HtmlWordExtractor()
+    try:
+        parser.feed(html)
+    except Exception:
+        pass  # tolerate malformed HTML
+
+    # Resolve links to absolute URLs
+    links = []
+    for href in parser.links:
+        try:
+            absolute = urljoin(base_url, href).split("#")[0]
+            if absolute.startswith(("http://", "https://")):
+                links.append(absolute)
+        except Exception:
+            pass
+
+    # Extract and filter words from visible text
+    words: set = set()
+    for chunk in parser.text.split():
+        chunk = chunk.strip("'\".,!?;:-()")
+        for word in _SPLIT_RE.split(chunk):
+            w = _filter_word(word, min_length, max_length, no_numbers)
+            if w:
+                words.add(w)
+
+    return words, links
+
+
+def is_in_scope(url: str, start_url: str, scope: str) -> bool:
+    """Check whether url falls within the crawl scope relative to start_url."""
+    try:
+        url_netloc = urlparse(url).netloc.lower()
+        start_netloc = urlparse(start_url).netloc.lower()
+    except Exception:
+        return False
+
+    if scope == "exact":
+        return url_netloc == start_netloc
+    if scope == "children":
+        return url_netloc == start_netloc or url_netloc.endswith("." + start_netloc)
+    # "all": share the same registered domain (last two labels)
+    def _root(netloc):
+        parts = netloc.split(".")
+        return ".".join(parts[-2:]) if len(parts) >= 2 else netloc
+    return _root(url_netloc) == _root(start_netloc)
+
+
+def crawl_url(
+    start_url: str,
+    depth: int,
+    rate: float,
+    scope: str,
+    user_agent: str,
+    min_length: int,
+    max_length,
+    no_numbers: bool,
+) -> set:
+    """BFS-crawl start_url up to depth hops; return set of extracted words."""
+    ua = user_agent or _DEFAULT_UA
+    min_interval = 1.0 / rate if rate > 0 else 0.0
+
+    queue: deque = deque([(start_url, 0)])
+    visited: set = set()
+    all_words: set = set()
+    last_request_time = 0.0
+
+    spinner = SpinnerBar(f"  Crawling {urlparse(start_url).netloc}")
+    page_count = 0
+
+    while queue:
+        url, current_depth = queue.popleft()
+        url = url.split("#")[0]
+        if not url or url in visited:
+            continue
+        visited.add(url)
+
+        elapsed = time.time() - last_request_time
+        if elapsed < min_interval:
+            time.sleep(min_interval - elapsed)
+
+        logging.debug("Crawling [depth=%d]: %s", current_depth, url)
+        spinner.update()
+
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": ua})
+            with urllib.request.urlopen(req, timeout=15) as response:
+                content_type = response.headers.get("Content-Type", "")
+                if "text/html" not in content_type:
+                    continue
+                html = response.read(5 * 1024 * 1024).decode("utf-8", errors="replace")
+            last_request_time = time.time()
+            page_count += 1
+        except OSError as e:
+            logging.debug("Skipping %s: %s", url, e)
+            continue
+
+        words, links = extract_words_from_html(html, url, min_length, max_length, no_numbers)
+        all_words |= words
+
+        if current_depth < depth:
+            for link in links:
+                if link not in visited and is_in_scope(link, start_url, scope):
+                    queue.append((link, current_depth + 1))
+
+    spinner.close()
+    logging.info(
+        "Crawl complete: %d pages visited, %d unique words extracted.",
+        page_count, len(all_words),
+    )
+    return all_words
+
+
+# ── Password variant generation ────────────────────────────────────────────────
 
 _YEARS = [str(y) for y in range(2015, 2027)]
 _NUM_SUFFIXES = ["1", "12", "123", "1234", "12345"]
@@ -266,15 +442,12 @@ def generate_password_variants(words: set) -> list:
 
         for form in (lower, title, upper):
             variants.add(form)
-
         for suf in _NUM_SUFFIXES:
             variants.add(lower + suf)
             variants.add(title + suf)
-
         for year in _YEARS:
             variants.add(title + year)
             variants.add(lower + year)
-
         for sym in _SYM_SUFFIXES:
             variants.add(title + sym)
             variants.add(lower + sym)
@@ -285,7 +458,7 @@ def generate_password_variants(words: set) -> list:
     return result
 
 
-# ── Statistics ─────────────────────────────────────────────────────────────────────────────────────────
+# ── Statistics ─────────────────────────────────────────────────────────────────
 
 def print_stats(words: list, base_count: int = None) -> None:
     if not words:
@@ -314,7 +487,7 @@ def print_stats(words: list, base_count: int = None) -> None:
     print("=" * 50)
 
 
-# ── Popular language presets ───────────────────────────────────────────────────────────────────
+# ── Popular language presets ───────────────────────────────────────────────────
 
 POPULAR_LANGUAGES = [
     "en", "de", "fr", "es", "it", "pt", "nl", "pl", "ru",
@@ -322,7 +495,7 @@ POPULAR_LANGUAGES = [
 ]
 
 
-# ── Cross-platform working dir ──────────────────────────────────────────────────────────────────
+# ── Cross-platform working dir ─────────────────────────────────────────────────
 
 def get_working_dir() -> Path:
     if sys.platform == "win32":
@@ -332,86 +505,174 @@ def get_working_dir() -> Path:
     return base / "wikipedia-dictionary-creator"
 
 
-# ── Main ─────────────────────────────────────────────────────────────────────────────────────────────
+# ── Output helpers ─────────────────────────────────────────────────────────────
+
+def _save_and_report(
+    words: set,
+    working_dir: Path,
+    label: str,
+    password_mode: bool,
+    args,
+) -> None:
+    """Shared final-step: optional password expansion, stats, write file."""
+    if not words:
+        logging.error("No words extracted. Nothing to save.")
+        return
+
+    base_count = len(words)
+
+    if password_mode:
+        final_words = generate_password_variants(words)
+        pw_path = working_dir / f"{label}-passwords.txt"
+        pw_path.write_text("\n".join(final_words), encoding="utf-8")
+        logging.info("Password list saved: %s (%d candidates)", pw_path, len(final_words))
+        print_stats(final_words, base_count=base_count)
+    else:
+        final_words = sorted(words)
+        wl_path = working_dir / f"{label}-wordlist.txt"
+        wl_path.write_text("\n".join(final_words), encoding="utf-8")
+        logging.info("Wordlist saved: %s (%d words)", wl_path, len(final_words))
+        print_stats(final_words)
+
+    print("\nProcess completed successfully.")
+
+
+# ── CLI ────────────────────────────────────────────────────────────────────────
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Generate wordlists / password lists from Wikipedia static HTML dumps.",
+        description=(
+            "Generate wordlists / password lists from Wikipedia dumps "
+            "or by crawling any website."
+        ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 examples:
-  # interactive mode with fuzzy language search
+  # interactive Wikipedia dump mode (fuzzy language search)
   %(prog)s
 
-  # download Norwegian (Norsk), apply filters, show stats
+  # Norwegian Wikipedia wordlist with filters
   %(prog)s --language no --min-length 5 --no-numbers --verbose
 
-  # download Swedish (Svenska) + English and merge
+  # Swedish + English merged dump
   %(prog)s --language sv,en --min-length 4 --no-numbers
 
-  # generate human-like password candidates from English + Norwegian
+  # human-like password candidates from English + Norwegian
   %(prog)s --language en,no --password-mode --min-length 5 --max-length 12
 
-  # download and merge all 18 major language dumps at once
+  # all 18 major language dumps at once
   %(prog)s --popular --password-mode --min-length 5
+
+  # crawl a single website (like cewler)
+  %(prog)s --url https://example.com --depth 2 --scope exact
+
+  # crawl with password-mode output
+  %(prog)s --url https://example.com --depth 3 --password-mode --min-length 5
+
+  # crawl multiple URLs from a file (one URL per line)
+  %(prog)s --url-file targets.txt --depth 2 --scope exact
 
   # force re-download to a custom directory
   %(prog)s --language en --force --output-dir /tmp/wordlists
 """,
     )
-    parser.add_argument(
+
+    # ── Crawl mode ──────────────────────────────────────────────
+    crawl_group = parser.add_argument_group("web crawl mode")
+    url_mx = crawl_group.add_mutually_exclusive_group()
+    url_mx.add_argument(
+        "--url",
+        metavar="URL",
+        help="Crawl this URL and extract a wordlist",
+    )
+    url_mx.add_argument(
+        "--url-file",
+        metavar="FILE",
+        help="Text file with one URL per line; crawls all and merges results",
+    )
+    crawl_group.add_argument(
+        "--depth", "-d",
+        type=int,
+        default=2,
+        metavar="N",
+        help="Maximum crawl depth from start URL (default: 2)",
+    )
+    crawl_group.add_argument(
+        "--rate", "-r",
+        type=float,
+        default=5.0,
+        metavar="N",
+        help="Maximum requests per second (default: 5.0)",
+    )
+    crawl_group.add_argument(
+        "--scope", "-s",
+        choices=["exact", "children", "all"],
+        default="exact",
+        help="Domain crawl scope: exact (default), children, all",
+    )
+    crawl_group.add_argument(
+        "--user-agent",
+        metavar="STR",
+        default=None,
+        help="Custom User-Agent string for crawl requests",
+    )
+
+    # ── Wikipedia dump mode ──────────────────────────────────────
+    dump_group = parser.add_argument_group("wikipedia dump mode")
+    dump_group.add_argument(
         "--language", "-l",
         nargs="+",
         metavar="CODE",
-        help="Language code(s) to download, e.g. 'en' or 'en,no,de' or 'en' 'no'",
+        help="Language code(s), e.g. 'en' or 'en,no,de' or 'en' 'no'",
     )
-    parser.add_argument(
-        "--output-dir",
-        metavar="DIR",
-        help="Directory to save output files (default: platform data dir)",
+    dump_group.add_argument(
+        "--popular",
+        action="store_true",
+        help="Download all 18 major language dumps: " + ", ".join(POPULAR_LANGUAGES),
     )
-    parser.add_argument(
+    dump_group.add_argument(
         "--force", "-f",
         action="store_true",
         help="Re-download even if a cached unfiltered file already exists",
     )
-    parser.add_argument(
+
+    # ── Shared options ───────────────────────────────────────────
+    shared_group = parser.add_argument_group("shared options")
+    shared_group.add_argument(
+        "--output-dir",
+        metavar="DIR",
+        help="Directory to save output files (default: platform data dir)",
+    )
+    shared_group.add_argument(
         "--min-length",
         type=int,
         default=3,
         metavar="N",
         help="Minimum word length to include (default: 3)",
     )
-    parser.add_argument(
+    shared_group.add_argument(
         "--max-length",
         type=int,
         default=None,
         metavar="N",
         help="Maximum word length to include (default: no limit)",
     )
-    parser.add_argument(
+    shared_group.add_argument(
         "--no-numbers",
         action="store_true",
         help="Exclude words that are purely numeric",
     )
-    parser.add_argument(
+    shared_group.add_argument(
         "--password-mode",
         action="store_true",
-        help="Generate near-human password candidates (case variants + number/year/symbol suffixes)",
+        help="Generate near-human password candidates (case + number/year/symbol suffixes)",
     )
-    parser.add_argument(
-        "--popular",
-        action="store_true",
-        help=(
-            "Download and merge all major language dumps: "
-            + ", ".join(POPULAR_LANGUAGES)
-        ),
-    )
-    parser.add_argument(
+    shared_group.add_argument(
         "--verbose", "-v",
         action="store_true",
         help="Enable debug logging",
     )
+
     return parser.parse_args()
 
 
@@ -419,7 +680,6 @@ def resolve_languages(raw: list, links: list) -> list:
     codes = []
     for item in raw:
         codes.extend(c.strip() for c in item.split(",") if c.strip())
-
     stripped_links = [l.strip("/").lower() for l in links]
     selected = []
     for code in codes:
@@ -431,6 +691,20 @@ def resolve_languages(raw: list, links: list) -> list:
     return selected
 
 
+def _load_url_file(path: str) -> list:
+    """Read URLs from a file, one per line. Skip blank lines and # comments."""
+    try:
+        lines = Path(path).read_text(encoding="utf-8").splitlines()
+    except OSError as e:
+        logging.error("Cannot read URL file %s: %s", path, e)
+        return []
+    urls = [l.strip() for l in lines if l.strip() and not l.strip().startswith("#")]
+    logging.info("Loaded %d URL(s) from %s", len(urls), path)
+    return urls
+
+
+# ── Main ───────────────────────────────────────────────────────────────────────
+
 def main() -> None:
     args = parse_args()
     setup_logging(args.verbose)
@@ -439,6 +713,42 @@ def main() -> None:
     working_dir.mkdir(parents=True, exist_ok=True)
     logging.debug("Output directory: %s", working_dir)
 
+    # ── Crawl mode ───────────────────────────────────────────────
+    if args.url or args.url_file:
+        urls = [args.url] if args.url else _load_url_file(args.url_file)
+        if not urls:
+            logging.error("No URLs to crawl.")
+            return
+
+        merged_words: set = set()
+        try:
+            for url in urls:
+                logging.info("Starting crawl: %s (depth=%d, scope=%s)", url, args.depth, args.scope)
+                merged_words |= crawl_url(
+                    start_url=url,
+                    depth=args.depth,
+                    rate=args.rate,
+                    scope=args.scope,
+                    user_agent=args.user_agent,
+                    min_length=args.min_length,
+                    max_length=args.max_length,
+                    no_numbers=args.no_numbers,
+                )
+        except KeyboardInterrupt:
+            logging.warning(
+                "Interrupted — saving partial results (%d words collected)...",
+                len(merged_words),
+            )
+
+        if len(urls) == 1:
+            label = urlparse(urls[0]).netloc.replace(":", "_") or "crawl"
+        else:
+            label = "crawl-merged"
+
+        _save_and_report(merged_words, working_dir, label, args.password_mode, args)
+        return
+
+    # ── Wikipedia dump mode ──────────────────────────────────────
     url, links = get_wikipedia_dumps()
     if not links:
         return
@@ -461,54 +771,43 @@ def main() -> None:
 
     logging.info("Selected language(s): %s", ", ".join(languages))
 
-    merged_words: set = set()
+    merged_words = set()
+    try:
+        for lang in languages:
+            lang_upper = lang.upper()
+            file_path = working_dir / f"{lang_upper}-unfiltered.txt"
+            dict_path = working_dir / f"{lang_upper}-wordlist.txt"
 
-    for lang in languages:
-        lang_upper = lang.upper()
-        file_path = working_dir / f"{lang_upper}-unfiltered.txt"
-        dict_path = working_dir / f"{lang_upper}-wordlist.txt"
+            if not download_titles(url, lang, file_path, force=args.force):
+                logging.warning("Skipping %s due to download failure.", lang)
+                continue
 
-        if not download_titles(url, lang, file_path, force=args.force):
-            logging.warning("Skipping %s due to download failure.", lang)
-            continue
+            words = clean_titles(
+                file_path,
+                min_length=args.min_length,
+                max_length=args.max_length,
+                no_numbers=args.no_numbers,
+            )
+            merged_words |= words
 
-        words = clean_titles(
-            file_path,
-            min_length=args.min_length,
-            max_length=args.max_length,
-            no_numbers=args.no_numbers,
+            sorted_words = sorted(words)
+            dict_path.write_text("\n".join(sorted_words), encoding="utf-8")
+            logging.info("Wordlist saved: %s (%d words)", dict_path, len(sorted_words))
+
+    except KeyboardInterrupt:
+        logging.warning(
+            "Interrupted — saving partial results (%d words collected)...",
+            len(merged_words),
         )
-        merged_words |= words
 
-        sorted_words = sorted(words)
-        dict_path.write_text("\n".join(sorted_words), encoding="utf-8")
-        logging.info("Wordlist saved: %s (%d words)", dict_path, len(sorted_words))
-
-    if not merged_words:
-        logging.error("No words extracted. Nothing to save.")
-        return
-
-    if len(languages) > 1:
+    if len(languages) > 1 and merged_words:
         merged_path = working_dir / "MERGED-wordlist.txt"
         sorted_merged = sorted(merged_words)
         merged_path.write_text("\n".join(sorted_merged), encoding="utf-8")
         logging.info("Merged wordlist saved: %s (%d words)", merged_path, len(sorted_merged))
 
-    final_words: list
-    base_count: int = len(merged_words)
-
-    if args.password_mode:
-        final_words = generate_password_variants(merged_words)
-        suffix = "MERGED" if len(languages) > 1 else languages[0].upper()
-        pw_path = working_dir / f"{suffix}-passwords.txt"
-        pw_path.write_text("\n".join(final_words), encoding="utf-8")
-        logging.info("Password list saved: %s (%d candidates)", pw_path, len(final_words))
-    else:
-        final_words = sorted(merged_words)
-        base_count = None
-
-    print_stats(final_words, base_count=base_count if args.password_mode else None)
-    print("\nProcess completed successfully.")
+    label = "MERGED" if len(languages) > 1 else languages[0].upper()
+    _save_and_report(merged_words, working_dir, label, args.password_mode, args)
 
 
 if __name__ == "__main__":
